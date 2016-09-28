@@ -1108,6 +1108,7 @@ future<> sstable::open_data() {
             });
         }).then([this] {
             this->set_clustering_components_ranges();
+            this->set_first_and_last_keys();
 
             // Get disk usage for this sstable (includes all components).
             _bytes_on_disk = 0;
@@ -1241,7 +1242,7 @@ void sstable::maybe_flush_pi_block(file_writer& out,
         // block size of new data.
         if (!clustering_key.empty()) {
             auto& rts = _pi_write.tombstone_accumulator->range_tombstones_for_row(
-                    clustering_key_prefix(clustering_key.values()));
+                    clustering_key_prefix::from_range(clustering_key.values()));
             for (const auto& rt : rts) {
                 auto start = composite::from_clustering_element(*_pi_write.schemap, rt.start);
                 auto end = composite::from_clustering_element(*_pi_write.schemap, rt.end);
@@ -1259,8 +1260,6 @@ void sstable::maybe_flush_pi_block(file_writer& out,
     }
 }
 
-// @clustering_key: it's expected that clustering key is already in its composite form.
-// NOTE: empty clustering key means that there is no clustering key.
 void sstable::write_column_name(file_writer& out, const composite& clustering_key, const std::vector<bytes_view>& column_names, composite::eoc marker) {
     // was defined in the schema, for example.
     auto c = composite::from_exploded(column_names, marker);
@@ -1415,7 +1414,7 @@ void sstable::write_collection(file_writer& out, const composite& clustering_key
     }
 }
 
-// write_datafile_clustered_row() is about writing a clustered_row to data file according to SSTables format.
+// This function is about writing a clustered_row to data file according to SSTables format.
 // clustered_row contains a set of cells sharing the same clustering key.
 void sstable::write_clustered_row(file_writer& out, const schema& schema, const clustering_row& clustered_row) {
     auto clustering_key = composite::from_clustering_element(schema, clustered_row.key());
@@ -1599,7 +1598,7 @@ static void seal_statistics(statistics& s, metadata_collector& collector,
 
     collector.construct_stats(stats);
     // NOTE: method serialized_size of stats_metadata must be implemented for
-    // a new type of compaction to get supported.
+    // a new type of stats to get supported.
     s.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
     s.hash.map[metadata_type::Stats] = offset;
 }
@@ -1777,8 +1776,6 @@ void components_writer::consume_end_of_stream() {
         _sst._collector.add_compression_ratio(_sst._compression.compressed_file_length(), _sst._compression.uncompressed_file_length());
     }
 
-    // NOTE: Cassandra gets partition name by calling getClass().getCanonicalName() on
-    // partition class.
     seal_statistics(_sst._statistics, _sst._collector, dht::global_partitioner().name(), _schema.bloom_filter_fp_chance());
 }
 
@@ -1841,7 +1838,6 @@ void sstable_writer::consume_end_of_stream()
     _sst.write_summary(_pc);
     _sst.write_filter(_pc);
     _sst.write_statistics(_pc);
-    // NOTE: write_compression means maybe_write_compression.
     _sst.write_compression(_pc);
 
     if (!_leave_unsealed) {
@@ -2095,36 +2091,45 @@ future<temporary_buffer<char>> sstable::data_read(uint64_t pos, size_t len, cons
     });
 }
 
-partition_key
-sstable::get_first_partition_key(const schema& s) const {
-    if (_summary.first_key.value.empty()) {
-        throw std::runtime_error("first key of summary is empty");
+void sstable::set_first_and_last_keys() {
+    if (_first && _last) {
+        return;
     }
-    return key::from_bytes(_summary.first_key.value).to_partition_key(s);
+    auto decorate_key = [this] (const char *m, const bytes& value) {
+        if (value.empty()) {
+            throw std::runtime_error(sprint("%s key of summary of %s is empty", m, get_filename()));
+        }
+        auto pk = key::from_bytes(value).to_partition_key(*_schema);
+        return dht::global_partitioner().decorate_key(*_schema, std::move(pk));
+    };
+    _first = decorate_key("first", _summary.first_key.value);
+    _last = decorate_key("last", _summary.last_key.value);
 }
 
-partition_key
-sstable::get_last_partition_key(const schema& s) const {
-    if (_summary.last_key.value.empty()) {
-        throw std::runtime_error("last key of summary is empty");
+const partition_key& sstable::get_first_partition_key() const {
+    return get_first_decorated_key().key();
+ }
+
+const partition_key& sstable::get_last_partition_key() const {
+    return get_last_decorated_key().key();
+}
+
+const dht::decorated_key& sstable::get_first_decorated_key() const {
+    if (!_first) {
+        throw std::runtime_error(sprint("first key of %s wasn't set", get_filename()));
     }
-    return key::from_bytes(_summary.last_key.value).to_partition_key(s);
+    return *_first;
 }
 
-dht::decorated_key sstable::get_first_decorated_key(const schema& s) const {
-    // FIXME: we can avoid generating the decorated key over and over again by
-    // storing it in the sstable object. The same applies to last().
-    auto pk = get_first_partition_key(s);
-    return dht::global_partitioner().decorate_key(s, std::move(pk));
+const dht::decorated_key& sstable::get_last_decorated_key() const {
+    if (!_last) {
+        throw std::runtime_error(sprint("last key of %s wasn't set", get_filename()));
+    }
+    return *_last;
 }
 
-dht::decorated_key sstable::get_last_decorated_key(const schema& s) const {
-    auto pk = get_last_partition_key(s);
-    return dht::global_partitioner().decorate_key(s, std::move(pk));
-}
-
-int sstable::compare_by_first_key(const schema& s, const sstable& other) const {
-    return get_first_decorated_key(s).tri_compare(s, other.get_first_decorated_key(s));
+int sstable::compare_by_first_key(const sstable& other) const {
+    return get_first_decorated_key().tri_compare(*_schema, other.get_first_decorated_key());
 }
 
 double sstable::get_compression_ratio() const {
@@ -2372,9 +2377,8 @@ future<range<partition_key>>
 sstable::get_sstable_key_range(const schema& s) {
     auto fut = read_summary(default_priority_class());
     return std::move(fut).then([this, &s] () mutable {
-        auto first = get_first_partition_key(s);
-        auto last = get_last_partition_key(s);
-        return make_ready_future<range<partition_key>>(range<partition_key>::make(first, last));
+        this->set_first_and_last_keys();
+        return make_ready_future<range<partition_key>>(range<partition_key>::make(get_first_partition_key(), get_last_partition_key()));
     });
 }
 

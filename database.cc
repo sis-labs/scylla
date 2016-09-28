@@ -549,6 +549,28 @@ column_family::make_reader(schema_ptr s,
     return make_combined_reader(std::move(readers));
 }
 
+mutation_reader
+column_family::make_streaming_reader(schema_ptr s,
+                           const query::partition_range& range) const {
+    auto& slice = query::full_slice;
+    auto& pc = service::get_local_streaming_read_priority();
+    if (query::is_wrap_around(range, *s)) {
+        // make_combined_reader() can't handle streams that wrap around yet.
+        fail(unimplemented::cause::WRAP_AROUND);
+    }
+
+    std::vector<mutation_reader> readers;
+    readers.reserve(_memtables->size() + 1);
+
+    for (auto&& mt : *_memtables) {
+        readers.emplace_back(mt->make_reader(s, range, slice, pc));
+    }
+
+    readers.emplace_back(make_sstable_reader(s, range, slice, pc, nullptr));
+
+    return make_combined_reader(std::move(readers));
+}
+
 // Not performance critical. Currently used for testing only.
 template <typename Func>
 future<bool>
@@ -1269,8 +1291,8 @@ column_family::compact_sstables(sstables::compaction_descriptor descriptor, bool
 static bool needs_cleanup(const lw_shared_ptr<sstables::sstable>& sst,
                    const lw_shared_ptr<std::vector<range<dht::token>>>& owned_ranges,
                    schema_ptr s) {
-    auto first = sst->get_first_partition_key(*s);
-    auto last = sst->get_last_partition_key(*s);
+    auto first = sst->get_first_partition_key();
+    auto last = sst->get_last_partition_key();
     auto first_token = dht::global_partitioner().get_token(*s, first);
     auto last_token = dht::global_partitioner().get_token(*s, last);
     range<dht::token> sst_token_range = range<dht::token>::make(first_token, last_token);
@@ -1361,6 +1383,19 @@ void column_family::set_compaction_strategy(sstables::compaction_strategy_type s
 
 size_t column_family::sstables_count() const {
     return _sstables->all()->size();
+}
+
+std::vector<uint64_t> column_family::sstable_count_per_level() const {
+    std::vector<uint64_t> count_per_level;
+    for (auto&& sst : *_sstables->all()) {
+        auto level = sst->get_sstable_level();
+
+        if (level + 1 > count_per_level.size()) {
+            count_per_level.resize(level + 1, 0UL);
+        }
+        count_per_level[level]++;
+    }
+    return count_per_level;
 }
 
 int64_t column_family::get_unleveled_sstables() const {
